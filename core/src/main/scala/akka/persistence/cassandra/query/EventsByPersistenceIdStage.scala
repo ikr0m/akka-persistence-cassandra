@@ -13,11 +13,9 @@ import akka.Done
 import akka.annotation.InternalApi
 import akka.persistence.PersistentRepr
 import akka.persistence.cassandra.ListenableFutureConverter
-import akka.persistence.cassandra.journal.CassandraJournal
 import akka.persistence.cassandra.journal.CassandraJournal.{ EventDeserializer, Serialized }
-import akka.persistence.cassandra.query.EventsByPersistenceIdStage.Extracted
-import akka.serialization.{ Serialization, SerializationExtension }
-import akka.stream.{ ActorMaterializer, Attributes, Outlet, SourceShape }
+import akka.serialization.Serialization
+import akka.stream.{ Attributes, Outlet, SourceShape }
 import akka.stream.stage._
 import com.datastax.driver.core._
 import com.datastax.driver.core.policies.RetryPolicy
@@ -27,24 +25,20 @@ import scala.collection.JavaConverters._
 import scala.concurrent.{ ExecutionContext, Future, Promise }
 import scala.concurrent.duration.{ FiniteDuration, _ }
 import scala.util.{ Failure, Success, Try }
-
 import akka.util.OptionVal
 
 /**
  * INTERNAL API
  */
 @InternalApi private[akka] object EventsByPersistenceIdStage {
-  trait Extracted {
-    def sequenceNr: Long
+
+  private[akka] case class TaggedPersistentRepr(pr: PersistentRepr, tags: Set[String], offset: UUID) {
+    def sequenceNr: Long = pr.sequenceNr
   }
 
-  private[akka] case class TaggedPersistentRepr(pr: PersistentRepr, tags: Set[String], offset: UUID) extends Extracted {
-    def sequenceNr = pr.sequenceNr
-  }
+  private[akka] case class OptionalTagged(sequenceNr: Long, tagged: OptionVal[TaggedPersistentRepr])
 
-  private[akka] case class OptionalTagged(sequenceNr: Long, tagged: OptionVal[TaggedPersistentRepr]) extends Extracted
-
-  private[akka] case class RawEvent(sequenceNr: Long, serialized: Serialized) extends Extracted
+  private[akka] case class RawEvent(sequenceNr: Long, serialized: Serialized)
 
   // materialized value
   trait Control {
@@ -117,58 +111,64 @@ import akka.util.OptionVal
 
   object Extractors {
 
-    type Extractor[T <: Extracted] = (Row, EventDeserializer, Serialization) => T
+    type Extractor[T] = (Row, EventDeserializer, Serialization, ExecutionContext) => Future[T]
 
-    final case class SeqNrValue(sequenceNr: Long) extends Extracted
+    final case class SeqNrValue(sequenceNr: Long)
 
-    final case class PersistentReprValue(persistentRepr: PersistentRepr) extends Extracted {
-      override def sequenceNr: Long = persistentRepr.sequenceNr
+    final case class PersistentReprValue(persistentRepr: PersistentRepr) {
+      def sequenceNr: Long = persistentRepr.sequenceNr
     }
 
-    val persistentRepr: Extractor[PersistentReprValue] = (row, ed, s) => {
-      val persistentRepr = extractPersistentRepr(row, ed, s)
-      PersistentReprValue(persistentRepr)
+    val persistentRepr: Extractor[PersistentReprValue] = (row, ed, s, ec) => {
+      implicit val executionContext = ec
+      extractPersistentRepr(row, ed, s).map(PersistentReprValue.apply)
     }
 
-    val taggedPersistentRepr: Extractor[TaggedPersistentRepr] = (row, ed, s) => {
-      val tags = extractTags(row, ed)
-      val persistentRepr = extractPersistentRepr(row, ed, s)
-      TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+    val taggedPersistentRepr: Extractor[TaggedPersistentRepr] = (row, ed, s, ec) => {
+      implicit val executionContext = ec
+      extractPersistentRepr(row, ed, s).map { persistentRepr =>
+        val tags = extractTags(row, ed)
+        TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+      }
     }
 
-    val optionalTaggedPersistentRepr: Extractor[OptionalTagged] = (row, ed, s) => {
+    val optionalTaggedPersistentRepr: Extractor[OptionalTagged] = (row, ed, s, ec) => {
+      implicit val executionContext = ec
       val seqNr = row.getLong("sequence_nr")
       val tags = extractTags(row, ed)
       if (tags.isEmpty) {
         // no tags, no need to extract more
-        OptionalTagged(seqNr, OptionVal.None)
+        Future.successful(OptionalTagged(seqNr, OptionVal.None))
       } else {
-        val persistentRepr = extractPersistentRepr(row, ed, s)
-        val tagged = TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
-        OptionalTagged(seqNr, OptionVal.Some(tagged))
+        extractPersistentRepr(row, ed, s).map { persistentRepr =>
+          val tagged = TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+          OptionalTagged(seqNr, OptionVal.Some(tagged))
+        }
       }
     }
 
     // TODO performance improvement could be to use another query that is not "select *"
-    val sequenceNumber: Extractor[SeqNrValue] = (row, ed, s) => {
-      SeqNrValue(row.getLong("sequence_nr"))
+    val sequenceNumber: Extractor[SeqNrValue] = (row, ed, s, ec) => {
+      Future.successful(SeqNrValue(row.getLong("sequence_nr")))
     }
 
-    private def extractPersistentRepr(row: Row, ed: EventDeserializer, s: Serialization): PersistentRepr = {
+    private def extractPersistentRepr(row: Row, ed: EventDeserializer, s: Serialization)(implicit ec: ExecutionContext): Future[PersistentRepr] = {
       row.getBytes("message") match {
         case null =>
-          PersistentRepr(
-            payload = ed.deserializeEvent(row),
-            sequenceNr = row.getLong("sequence_nr"),
-            persistenceId = row.getString("persistence_id"),
-            manifest = row.getString("event_manifest"), // manifest for event adapters
-            deleted = false,
-            sender = null,
-            writerUuid = row.getString("writer_uuid")
-          )
+          ed.deserializeEvent(row).map { payload =>
+            PersistentRepr(
+              payload,
+              sequenceNr = row.getLong("sequence_nr"),
+              persistenceId = row.getString("persistence_id"),
+              manifest = row.getString("event_manifest"), // manifest for event adapters
+              deleted = false,
+              sender = null,
+              writerUuid = row.getString("writer_uuid")
+            )
+          }
         case b =>
           // for backwards compatibility
-          persistentFromByteBuffer(s, b)
+          Future.successful(persistentFromByteBuffer(s, b))
       }
     }
 
@@ -202,31 +202,22 @@ import akka.util.OptionVal
 /**
  * INTERNAL API
  */
-@InternalApi private[akka] class EventsByPersistenceIdStage[T <: Extracted](persistenceId: String, fromSeqNr: Long, toSeqNr: Long, max: Long,
-                                                                            fetchSize: Int, refreshInterval: Option[FiniteDuration],
-                                                                            session:   EventsByPersistenceIdStage.EventsByPersistenceIdSession,
-                                                                            config:    CassandraReadJournalConfig,
-                                                                            extractor: (Row, EventDeserializer, Serialization) => T)
-  extends GraphStageWithMaterializedValue[SourceShape[T], EventsByPersistenceIdStage.Control] {
+@InternalApi private[akka] class EventsByPersistenceIdStage(persistenceId: String, fromSeqNr: Long, toSeqNr: Long, max: Long,
+                                                            fetchSize: Int, refreshInterval: Option[FiniteDuration],
+                                                            session: EventsByPersistenceIdStage.EventsByPersistenceIdSession,
+                                                            config:  CassandraReadJournalConfig)
+  extends GraphStageWithMaterializedValue[SourceShape[Row], EventsByPersistenceIdStage.Control] {
 
   import EventsByPersistenceIdStage._
 
-  val out: Outlet[T] = Outlet("EventsByPersistenceId.out")
-  override val shape: SourceShape[T] = SourceShape(out)
+  val out: Outlet[Row] = Outlet("EventsByPersistenceId.out")
+  override val shape: SourceShape[Row] = SourceShape(out)
 
   override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Control) = {
     val logic = new TimerGraphStageLogic(shape) with OutHandler with StageLogging with Control {
 
-      override protected def logSource: Class[_] = classOf[EventsByPersistenceIdStage[T]]
+      override protected def logSource: Class[_] = classOf[EventsByPersistenceIdStage]
 
-      // lazy because materializer not initialized in constructor
-      lazy val system = materializer match {
-        case a: ActorMaterializer => a.system
-        case _ =>
-          throw new IllegalStateException("EventsByPersistenceId requires ActorMaterializer")
-      }
-      lazy val serialization: Serialization = SerializationExtension(system)
-      lazy val eventDeserializer: CassandraJournal.EventDeserializer = new CassandraJournal.EventDeserializer(serialization)
       implicit def ec = materializer.executionContext
       val fetchMoreThresholdRows = (fetchSize * config.fetchMoreThreshold).toInt
 
@@ -302,8 +293,6 @@ import akka.util.OptionVal
         (sequenceNr - 1L) / config.targetPartitionSize
 
       override def preStart(): Unit = {
-        system // fail fast if not ActorMaterializer
-
         queryState = QueryInProgress(switchPartition = false, fetchMore = false, System.nanoTime())
         session.highestDeletedSequenceNumber(persistenceId).onComplete {
           getAsyncCallback[Try[Long]] {
@@ -460,11 +449,11 @@ import akka.util.OptionVal
               rsFut.onComplete(newResultSetCb.invoke)
             } else {
               val row = rs.one()
-              val event: T = extractEvent(row)
-              if (event.sequenceNr < seqNr || pendingFastForward.isDefined && pendingFastForward.get > event.sequenceNr) {
+              val sequenceNr = extractSeqNr(row)
+              if (sequenceNr < seqNr || pendingFastForward.isDefined && pendingFastForward.get > sequenceNr) {
                 // skip event due to fast forward
                 tryPushOne()
-              } else if (pendingFastForward.isEmpty && (config.gapFreeSequenceNumbers && seqNr != event.sequenceNr)) {
+              } else if (pendingFastForward.isEmpty && (config.gapFreeSequenceNumbers && seqNr != sequenceNr)) {
                 lookingForMissingSeqNr match {
                   case Some(_) => throw new IllegalStateException(
                     s"Should not be able to get here when already looking for missing seqNr [$seqNr] for entity [$persistenceId]"
@@ -472,10 +461,10 @@ import akka.util.OptionVal
                   case None =>
                     log.debug(
                       "EventsByPersistenceId [{}] Missing seqNr [{}], found [{}], looking for event eventually appear",
-                      persistenceId, seqNr, event.sequenceNr
+                      persistenceId, seqNr, sequenceNr
                     )
                     lookingForMissingSeqNr = Some(
-                      MissingSeqNr(Deadline.now + config.eventsByPersistenceIdEventTimeout, event.sequenceNr)
+                      MissingSeqNr(Deadline.now + config.eventsByPersistenceIdEventTimeout, sequenceNr)
                     )
                     // Forget about any other rows in this result set until we find
                     // the missing sequence nrs
@@ -483,10 +472,10 @@ import akka.util.OptionVal
                     query(false)
                 }
               } else {
-                seqNr = event.sequenceNr + 1
+                seqNr = sequenceNr + 1
                 partition = row.getLong("partition_nr")
                 count += 1
-                push(out, event)
+                push(out, row)
 
                 if (reachedEndCondition())
                   completeStage()
@@ -494,7 +483,7 @@ import akka.util.OptionVal
                   // we found that missing seqNr
                   log.debug(
                     "EventsByPersistenceId [{}] Found missing seqNr [{}]",
-                    persistenceId, event.sequenceNr
+                    persistenceId, sequenceNr
                   )
                   lookingForMissingSeqNr = None
                   queryState = QueryIdle
@@ -514,7 +503,7 @@ import akka.util.OptionVal
         }
       }
 
-      def extractEvent(row: Row): T = extractor(row, eventDeserializer, serialization)
+      def extractSeqNr(row: Row): Long = row.getLong("sequence_nr")
 
       def reachedEndCondition(): Boolean =
         seqNr > toSeqNr || count >= max

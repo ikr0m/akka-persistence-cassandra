@@ -4,7 +4,9 @@
 
 package akka.persistence.cassandra
 
-import akka.actor.{ ActorSystem, ExtendedActorSystem }
+import scala.concurrent.ExecutionContext
+
+import akka.actor.ActorSystem
 import akka.pattern.ask
 import akka.event.Logging
 import akka.persistence.PersistentRepr
@@ -23,14 +25,14 @@ import akka.util.Timeout
 import akka.{ Done, NotUsed }
 import com.datastax.driver.core.Row
 import com.datastax.driver.core.utils.Bytes
-
 import scala.concurrent.Future
 import scala.concurrent.duration._
 
 object EventsByTagMigration {
   def apply(system: ActorSystem): EventsByTagMigration = new EventsByTagMigration(system)
+
   // Extracts a Cassandra Row, assuming the pre 0.80 schema into a [[RawEvent]]
-  val RawPayloadOldTagSchema = (bucketSize: BucketSize, transportInformation: Option[Serialization.Information]) => (row: Row, ed: EventDeserializer, serialization: Serialization) => {
+  val RawPayloadOldTagSchema: (BucketSize, ActorSystem) => (Row, EventDeserializer, Serialization, ExecutionContext) => Future[RawEvent] = { (bucketSize, system) => (row, ed, serialization, ec) => {
     // Get the tags from the old location i.e. tag1, tag2, tag3
     val tags: Set[String] =
       if (ed.hasOldTagsColumns(row)) {
@@ -53,7 +55,7 @@ object EventsByTagMigration {
 
     row.getBytes("message") match {
       case null =>
-        RawEvent(
+        Future.successful(RawEvent(
           sequenceNr,
           Serialized(
             row.getString("persistence_id"),
@@ -68,16 +70,17 @@ object EventsByTagMigration {
             timeUuid,
             timeBucket = TimeBucket(timeUuid, bucketSize)
           )
-        )
+        ))
       case bytes =>
         // This is an event from version 0.7 that used to serialise the PersistentRepr in the
         // message column rather than the event column
         val pr = serialization.deserialize(Bytes.getArray(bytes), classOf[PersistentRepr]).get
-        RawEvent(
-          sequenceNr,
-          serializeEvent(pr, tags, timeUuid, bucketSize, serialization, transportInformation)
-        )
+        implicit val executionContext = ec
+        serializeEvent(pr, tags, timeUuid, bucketSize, serialization, system).map { serEvent =>
+          RawEvent(sequenceNr, serEvent)
+        }
     }
+  }
   }
 }
 
@@ -196,7 +199,7 @@ class EventsByTagMigration(system: ActorSystem)
                 config.replayMaxResultSize,
                 None,
                 s"migrateToTag-$pid",
-                extractor = EventsByTagMigration.RawPayloadOldTagSchema(config.bucketSize, transportInformation)
+                extractor = EventsByTagMigration.RawPayloadOldTagSchema(config.bucketSize, system)
               ).map(sendMissingTagWriteRaw(tp, tagWriters))
                 .buffer(periodicFlush, OverflowStrategy.backpressure)
                 .mapAsync(1)(_ => (tagWriters ? FlushAllTagWriters).mapTo[AllFlushed.type])
@@ -211,9 +214,4 @@ class EventsByTagMigration(system: ActorSystem)
     } yield Done
   }
 
-  private lazy val transportInformation: Option[Serialization.Information] = {
-    val address = system.asInstanceOf[ExtendedActorSystem].provider.getDefaultAddress
-    if (address.hasLocalScope) None
-    else Some(Serialization.Information(address, system))
-  }
 }

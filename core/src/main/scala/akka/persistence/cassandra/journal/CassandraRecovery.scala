@@ -68,7 +68,7 @@ trait CassandraRecovery extends CassandraTagRecovery
               someReadConsistency,
               someReadRetryPolicy,
               extractor = Extractors.taggedPersistentRepr
-            ).map(sendMissingTagWrite(tp, tagWrites.get))
+            ).mapAsync(1)(sendMissingTagWrite(tp, tagWrites.get))
         })
       )
         .map(te => queries.mapEvent(te.pr))
@@ -115,33 +115,44 @@ trait CassandraRecovery extends CassandraTagRecovery
       someReadConsistency,
       someReadRetryPolicy,
       Extractors.optionalTaggedPersistentRepr
-    ).map { t =>
+    )
+      .mapAsync(1) { t =>
         t.tagged match {
           case OptionVal.Some(tpr) => sendMissingTagWrite(tp, tagWrites.get)(tpr)
-          case OptionVal.None      => // no tags, skip
+          case OptionVal.None      => FutureDone // no tags, skip
         }
-      }.runWith(Sink.ignore)
+      }
+      .runWith(Sink.ignore)
   } else {
     log.debug("Recovery is starting before the latest tag writes tag progress. Min progress for pid {}. " +
       "From sequence nr of recovery: {}", minProgressNr, fromSequenceNr)
-    Future.successful(Done)
+    FutureDone
   }
 
   // TODO migrate this to using raw, maybe after offering a way to migrate old events in message?
-  private def sendMissingTagWrite(tp: Map[Tag, TagProgress], to: ActorRef)(tpr: TaggedPersistentRepr): TaggedPersistentRepr = {
-    tpr.tags.foreach(tag => {
-      val serialized = serializeEvent(tpr.pr, tpr.tags, tpr.offset, bucketSize, serialization, transportInformation)
-      tp.get(tag) match {
-        case None =>
-          log.debug("Tag write not in progress. Sending to TagWriter. Tag {} Sequence Nr {}.", tag, tpr.sequenceNr)
-          to ! TagWrite(tag, serialized :: Nil)
-        case Some(progress) =>
-          if (tpr.sequenceNr > progress.sequenceNr) {
-            log.debug("Sequence nr > than write progress. Sending to TagWriter. Tag {} Sequence Nr {}. ", tag, tpr.sequenceNr)
-            to ! TagWrite(tag, serialized :: Nil)
+  private def sendMissingTagWrite(tp: Map[Tag, TagProgress], to: ActorRef)(tpr: TaggedPersistentRepr): Future[TaggedPersistentRepr] = {
+    if (tpr.tags.isEmpty) Future.successful(tpr)
+    else {
+      val completed: List[Future[Done]] =
+        tpr.tags.toList.map(tag => tag -> serializeEvent(tpr.pr, tpr.tags, tpr.offset, bucketSize, serialization, context.system))
+          .map {
+            case (tag, serializedFut) => serializedFut.map { serialized =>
+              tp.get(tag) match {
+                case None =>
+                  log.debug("Tag write not in progress. Sending to TagWriter. Tag {} Sequence Nr {}.", tag, tpr.sequenceNr)
+                  to ! TagWrite(tag, serialized :: Nil)
+                  Done
+                case Some(progress) =>
+                  if (tpr.sequenceNr > progress.sequenceNr) {
+                    log.debug("Sequence nr > than write progress. Sending to TagWriter. Tag {} Sequence Nr {}. ", tag, tpr.sequenceNr)
+                    to ! TagWrite(tag, serialized :: Nil)
+                  }
+                  Done
+              }
+            }
           }
-      }
-    })
-    tpr
+
+      Future.sequence(completed).map(_ => tpr)
+    }
   }
 }
