@@ -12,7 +12,7 @@ import java.util.concurrent.Executor
 
 import akka.persistence.cassandra.journal.{ BucketSize, TimeBucket }
 import akka.persistence.cassandra.journal.CassandraJournal.{ Serialized, SerializedMeta }
-import akka.serialization.{ Serialization, SerializerWithStringManifest }
+import akka.serialization.Serialization
 import com.datastax.driver.core.utils.UUIDs
 import com.google.common.util.concurrent.ListenableFuture
 import scala.concurrent._
@@ -67,13 +67,7 @@ package object cassandra {
           case EventWithMetaData(_, m) =>
             val m2 = m.asInstanceOf[AnyRef]
             val serializer = serialization.findSerializerFor(m2)
-            val serManifest = serializer match {
-              case ser2: SerializerWithStringManifest ⇒
-                ser2.manifest(m2)
-              case _ ⇒
-                if (serializer.includeManifest) m2.getClass.getName
-                else PersistentRepr.Undefined
-            }
+            val serManifest = Serializers.manifestFor(serializer, m2)
             val metaBuf = ByteBuffer.wrap(serialization.serialize(m2).get)
             Some(SerializedMeta(metaBuf, serManifest, serializer.identifier))
           case _ => None
