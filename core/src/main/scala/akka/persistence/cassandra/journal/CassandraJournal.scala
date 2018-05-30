@@ -396,7 +396,7 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal
     def hasTagsColumn(row: Row): Boolean =
       hasColumn("tags", row, _hasTagsColumn, updateTagsColumnCache)
 
-    def deserializeEvent(row: Row)(implicit ec: ExecutionContext): Future[Any] = try {
+    def deserializeEvent(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[Any] = try {
 
       def meta: OptionVal[AnyRef] = {
         if (hasMetaColumns(row)) {
@@ -442,7 +442,7 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal
           }
 
         case _ =>
-          Future {
+          def deserializedEvent: AnyRef = {
             // Serialization.deserialize adds transport info
             val event = serialization.deserialize(bytes, serId, manifest).get
             meta match {
@@ -450,6 +450,9 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal
               case OptionVal.Some(m) => EventWithMetaData(event, m)
             }
           }
+
+          if (async) Future(deserializedEvent)
+          else Future.successful(deserializedEvent)
       }
 
     } catch {

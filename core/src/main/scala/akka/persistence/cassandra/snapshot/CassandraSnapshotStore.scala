@@ -334,7 +334,7 @@ private[snapshot] object CassandraSnapshotStore {
           }
 
         case _ =>
-          Future {
+          Future.successful {
             // Serialization.deserialize adds transport info
             val payload = serialization.deserialize(bytes, serId, manifest).get
             meta match {

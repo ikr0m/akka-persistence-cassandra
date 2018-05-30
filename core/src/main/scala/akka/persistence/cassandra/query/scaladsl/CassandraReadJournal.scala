@@ -21,7 +21,6 @@ import akka.persistence.cassandra.query.EventsByTagStage.TagStageSession
 import akka.persistence.cassandra.query._
 import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal.CombinedEventsByTagStmts
 import akka.persistence.cassandra.session.scaladsl.CassandraSession
-import akka.persistence.journal.EventAdapter
 import akka.persistence.query._
 import akka.persistence.query.scaladsl._
 import akka.persistence.{ Persistence, PersistentRepr }
@@ -99,10 +98,15 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
   private val writePluginConfig = new CassandraJournalConfig(system, system.settings.config.getConfig(writePluginId))
   private val queryPluginConfig = new CassandraReadJournalConfig(cfg, writePluginConfig)
   private val eventAdapters = Persistence(system).adaptersFor(writePluginId)
+
+  // The EventDeserializer is caching some things based on the column structure and
+  // therefore different instances must be used for the eventsByPersistenceId and eventsByTag
+  // queries, since the messages table might have a different structure than the tag view.
   private val eventsByPersistenceIdDeserializer: CassandraJournal.EventDeserializer =
     new CassandraJournal.EventDeserializer(system)
   private val eventsByTagDeserializer: CassandraJournal.EventDeserializer =
     new CassandraJournal.EventDeserializer(system)
+
   private val serialization = SerializationExtension(system)
   implicit private val ec = system.dispatchers.lookup(queryPluginConfig.pluginDispatcher)
   implicit private val materializer = ActorMaterializer()(system)
@@ -325,10 +329,11 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
   }
 
   private def deserializeEventsByTagRow: Flow[EventsByTagStage.UUIDRow, UUIDPersistentRepr, NotUsed] = {
+    val deserializeEventAsync = queryPluginConfig.deserializationParallelism > 1
     Flow[EventsByTagStage.UUIDRow]
-      .mapAsync(1) { uuidRow => // TODO we could do pipelined serialization by using parallelism > 1
+      .mapAsync(queryPluginConfig.deserializationParallelism) { uuidRow =>
         val row = uuidRow.row
-        eventsByTagDeserializer.deserializeEvent(row).map { payload =>
+        eventsByTagDeserializer.deserializeEvent(row, deserializeEventAsync).map { payload =>
           val repr = mapEvent(PersistentRepr(
             payload,
             sequenceNr = uuidRow.sequenceNr,
@@ -492,7 +497,7 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
       queryPluginConfig.fetchSize,
       Some(queryPluginConfig.refreshInterval),
       s"eventsByPersistenceId-$persistenceId",
-      extractor = Extractors.persistentRepr
+      extractor = Extractors.persistentRepr(eventsByPersistenceIdDeserializer, serialization)
     )
       .mapMaterializedValue(_ => NotUsed)
       .map(p => mapEvent(p.persistentRepr))
@@ -516,7 +521,7 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
       queryPluginConfig.fetchSize,
       None,
       s"currentEventsByPersistenceId-$persistenceId",
-      extractor = Extractors.persistentRepr
+      extractor = Extractors.persistentRepr(eventsByPersistenceIdDeserializer, serialization)
     )
       .mapMaterializedValue(_ => NotUsed)
       .map(p => mapEvent(p.persistentRepr))
@@ -539,7 +544,7 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
       queryPluginConfig.fetchSize,
       refreshInterval.orElse(Some(queryPluginConfig.refreshInterval)),
       s"eventsByPersistenceId-$persistenceId",
-      extractor = Extractors.persistentRepr
+      extractor = Extractors.persistentRepr(eventsByPersistenceIdDeserializer, serialization)
     ).map(p => mapEvent(p.persistentRepr))
       .mapConcat(r => toEventEnvelopes(r, r.sequenceNr))
 
@@ -563,6 +568,8 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
     extractor:              Extractor[T]
   ): Source[T, Future[EventsByPersistenceIdStage.Control]] = {
 
+    val deserializeEventAsync = queryPluginConfig.deserializationParallelism > 1
+
     createFutureSource(combinedEventsByPersistenceIdStmts) { (s, c) =>
       log.debug("Creating EventByPersistentIdState graph")
       Source.fromGraph(new EventsByPersistenceIdStage(
@@ -584,8 +591,8 @@ class CassandraReadJournal(system: ExtendedActorSystem, cfg: Config)
         .withAttributes(ActorAttributes.dispatcher(queryPluginConfig.pluginDispatcher))
         .named(name)
     }
-      .mapAsync(1) { row => // TODO we could do pipelined serialization by using parallelism > 1
-        extractor(row, eventsByPersistenceIdDeserializer, serialization, ec)
+      .mapAsync(queryPluginConfig.deserializationParallelism) { row =>
+        extractor.extract(row, deserializeEventAsync)
       }
       .withAttributes(ActorAttributes.dispatcher(queryPluginConfig.pluginDispatcher))
   }

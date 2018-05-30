@@ -25,6 +25,9 @@ trait CassandraRecovery extends CassandraTagRecovery
 
   import config._
 
+  private[akka] val eventDeserializer: CassandraJournal.EventDeserializer =
+    new CassandraJournal.EventDeserializer(context.system)
+
   private[akka] def asyncReadHighestSequenceNrInternal(persistenceId: String, fromSequenceNr: Long): Future[Long] = {
     log.debug("asyncReadHighestSequenceNr {} {}", persistenceId, fromSequenceNr)
     asyncHighestDeletedSequenceNumber(persistenceId).flatMap { h =>
@@ -67,7 +70,7 @@ trait CassandraRecovery extends CassandraTagRecovery
               "asyncReplayMessages",
               someReadConsistency,
               someReadRetryPolicy,
-              extractor = Extractors.taggedPersistentRepr
+              extractor = Extractors.taggedPersistentRepr(eventDeserializer, serialization)
             ).mapAsync(1)(sendMissingTagWrite(tp, tagWrites.get))
         })
       )
@@ -87,7 +90,7 @@ trait CassandraRecovery extends CassandraTagRecovery
           "asyncReplayMessages",
           someReadConsistency,
           someReadRetryPolicy,
-          extractor = Extractors.persistentRepr
+          extractor = Extractors.persistentRepr(eventDeserializer, serialization)
         )
         .map(p => queries.mapEvent(p.persistentRepr))
         .runForeach(replayCallback)
@@ -114,7 +117,7 @@ trait CassandraRecovery extends CassandraTagRecovery
       "asyncReplayMessagesPreSnapshot",
       someReadConsistency,
       someReadRetryPolicy,
-      Extractors.optionalTaggedPersistentRepr
+      Extractors.optionalTaggedPersistentRepr(eventDeserializer, serialization)
     )
       .mapAsync(1) { t =>
         t.tagged match {

@@ -111,7 +111,9 @@ import akka.util.OptionVal
 
   object Extractors {
 
-    type Extractor[T] = (Row, EventDeserializer, Serialization, ExecutionContext) => Future[T]
+    abstract class Extractor[T](val eventDeserializer: EventDeserializer, val serialization: Serialization) {
+      def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[T]
+    }
 
     final case class SeqNrValue(sequenceNr: Long)
 
@@ -119,43 +121,50 @@ import akka.util.OptionVal
       def sequenceNr: Long = persistentRepr.sequenceNr
     }
 
-    val persistentRepr: Extractor[PersistentReprValue] = (row, ed, s, ec) => {
-      implicit val executionContext = ec
-      extractPersistentRepr(row, ed, s).map(PersistentReprValue.apply)
-    }
-
-    val taggedPersistentRepr: Extractor[TaggedPersistentRepr] = (row, ed, s, ec) => {
-      implicit val executionContext = ec
-      extractPersistentRepr(row, ed, s).map { persistentRepr =>
-        val tags = extractTags(row, ed)
-        TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+    def persistentRepr(ed: EventDeserializer, s: Serialization): Extractor[PersistentReprValue] =
+      new Extractor[PersistentReprValue](ed, s) {
+        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[PersistentReprValue] =
+          extractPersistentRepr(row, ed, s, async).map(PersistentReprValue.apply)
       }
-    }
 
-    val optionalTaggedPersistentRepr: Extractor[OptionalTagged] = (row, ed, s, ec) => {
-      implicit val executionContext = ec
-      val seqNr = row.getLong("sequence_nr")
-      val tags = extractTags(row, ed)
-      if (tags.isEmpty) {
-        // no tags, no need to extract more
-        Future.successful(OptionalTagged(seqNr, OptionVal.None))
-      } else {
-        extractPersistentRepr(row, ed, s).map { persistentRepr =>
-          val tagged = TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
-          OptionalTagged(seqNr, OptionVal.Some(tagged))
+    def taggedPersistentRepr(ed: EventDeserializer, s: Serialization): Extractor[TaggedPersistentRepr] =
+      new Extractor[TaggedPersistentRepr](ed, s) {
+        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[TaggedPersistentRepr] = {
+          extractPersistentRepr(row, ed, s, async).map { persistentRepr =>
+            val tags = extractTags(row, ed)
+            TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+          }
         }
       }
-    }
+
+    def optionalTaggedPersistentRepr(ed: EventDeserializer, s: Serialization): Extractor[OptionalTagged] =
+      new Extractor[OptionalTagged](ed, s) {
+        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[OptionalTagged] = {
+          val seqNr = row.getLong("sequence_nr")
+          val tags = extractTags(row, ed)
+          if (tags.isEmpty) {
+            // no tags, no need to extract more
+            Future.successful(OptionalTagged(seqNr, OptionVal.None))
+          } else {
+            extractPersistentRepr(row, ed, s, async).map { persistentRepr =>
+              val tagged = TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
+              OptionalTagged(seqNr, OptionVal.Some(tagged))
+            }
+          }
+        }
+      }
 
     // TODO performance improvement could be to use another query that is not "select *"
-    val sequenceNumber: Extractor[SeqNrValue] = (row, ed, s, ec) => {
-      Future.successful(SeqNrValue(row.getLong("sequence_nr")))
-    }
+    def sequenceNumber(ed: EventDeserializer, s: Serialization): Extractor[SeqNrValue] =
+      new Extractor[SeqNrValue](ed, s) {
+        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[SeqNrValue] =
+          Future.successful(SeqNrValue(row.getLong("sequence_nr")))
+      }
 
-    private def extractPersistentRepr(row: Row, ed: EventDeserializer, s: Serialization)(implicit ec: ExecutionContext): Future[PersistentRepr] = {
+    private def extractPersistentRepr(row: Row, ed: EventDeserializer, s: Serialization, async: Boolean)(implicit ec: ExecutionContext): Future[PersistentRepr] = {
       row.getBytes("message") match {
         case null =>
-          ed.deserializeEvent(row).map { payload =>
+          ed.deserializeEvent(row, async).map { payload =>
             PersistentRepr(
               payload,
               sequenceNr = row.getLong("sequence_nr"),
